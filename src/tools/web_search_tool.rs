@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// Web search tool for searching the internet.
-/// Supports multiple providers: DuckDuckGo (free), Brave (requires API key).
+/// Supports multiple providers: DuckDuckGo (free), Brave (requires API key), SearXNG (self-hosted).
 ///
 /// The Brave API key is resolved lazily at execution time: if the boot-time key
 /// is missing or still encrypted, the tool re-reads `config.toml`, decrypts the
@@ -16,6 +16,8 @@ pub struct WebSearchTool {
     provider: String,
     /// Boot-time key snapshot (may be `None` if not yet configured at startup).
     boot_brave_api_key: Option<String>,
+    /// Optional API URL for self-hosted providers like SearXNG.
+    api_url: Option<String>,
     max_results: usize,
     timeout_secs: u64,
     /// Path to `config.toml` for lazy re-read of keys at execution time.
@@ -34,6 +36,7 @@ impl WebSearchTool {
         Self {
             provider: provider.trim().to_lowercase(),
             boot_brave_api_key: brave_api_key,
+            api_url: None,
             max_results: max_results.clamp(1, 10),
             timeout_secs: timeout_secs.max(1),
             config_path: PathBuf::new(),
@@ -57,6 +60,28 @@ impl WebSearchTool {
         Self {
             provider: provider.trim().to_lowercase(),
             boot_brave_api_key: brave_api_key,
+            api_url: None,
+            max_results: max_results.clamp(1, 10),
+            timeout_secs: timeout_secs.max(1),
+            config_path,
+            secrets_encrypt,
+        }
+    }
+
+    /// Create a `WebSearchTool` with full configuration including API URL.
+    pub fn new_with_url(
+        provider: String,
+        brave_api_key: Option<String>,
+        api_url: Option<String>,
+        max_results: usize,
+        timeout_secs: u64,
+        config_path: PathBuf,
+        secrets_encrypt: bool,
+    ) -> Self {
+        Self {
+            provider: provider.trim().to_lowercase(),
+            boot_brave_api_key: brave_api_key,
+            api_url: api_url.filter(|s| !s.trim().is_empty()).map(|s| s.trim().to_string()),
             max_results: max_results.clamp(1, 10),
             timeout_secs: timeout_secs.max(1),
             config_path,
@@ -246,6 +271,77 @@ impl WebSearchTool {
 
         Ok(lines.join("\n"))
     }
+
+    async fn search_searxng(&self, query: &str) -> anyhow::Result<String> {
+        let api_url = self
+            .api_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "web_search provider 'searxng' requires [web_search].api_url in config.toml"
+                )
+            })?;
+
+        let encoded_query = urlencoding::encode(query);
+        let search_url = format!(
+            "{}/search?q={}&format=json&safesearch=0",
+            api_url.trim_end_matches('/'),
+            encoded_query
+        );
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(self.timeout_secs))
+            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+            .build()?;
+
+        let response = client
+            .get(&search_url)
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("SearXNG search failed: {e}"))?;
+
+        if !response.status().is_success() {
+            anyhow::bail!("SearXNG search failed with status: {}", response.status());
+        }
+
+        let json: serde_json::Value = response.json().await?;
+        self.parse_searxng_results(&json, query)
+    }
+
+    fn parse_searxng_results(&self, json: &serde_json::Value, query: &str) -> anyhow::Result<String> {
+        let results = json
+            .get("results")
+            .and_then(|r| r.as_array())
+            .ok_or_else(|| anyhow::anyhow!("Invalid SearXNG API response: missing 'results' array"))?;
+
+        if results.is_empty() {
+            return Ok(format!("No results found for: {}", query));
+        }
+
+        let mut lines = vec![format!("Search results for: {} (via SearXNG)", query)];
+
+        for (i, result) in results.iter().take(self.max_results).enumerate() {
+            let title = result
+                .get("title")
+                .and_then(|t| t.as_str())
+                .unwrap_or("No title");
+            let url = result.get("url").and_then(|u| u.as_str()).unwrap_or("");
+            let content = result
+                .get("content")
+                .and_then(|c| c.as_str())
+                .unwrap_or("");
+
+            lines.push(format!("{}. {}", i + 1, title));
+            lines.push(format!("   {}", url));
+            if !content.is_empty() {
+                lines.push(format!("   {}", content));
+            }
+        }
+
+        Ok(lines.join("\n"))
+    }
 }
 
 fn decode_ddg_redirect_url(raw_url: &str) -> String {
@@ -303,8 +399,9 @@ impl Tool for WebSearchTool {
         let result = match self.provider.as_str() {
             "duckduckgo" | "ddg" => self.search_duckduckgo(query).await?,
             "brave" => self.search_brave(query).await?,
+            "searxng" => self.search_searxng(query).await?,
             _ => anyhow::bail!(
-                "Unknown search provider: '{}'. Set tools.web_search.provider to 'duckduckgo' or 'brave' in config.toml",
+                "Unknown search provider: '{}'. Set web_search.provider to 'duckduckgo', 'brave', or 'searxng' in config.toml",
                 self.provider
             ),
         };
